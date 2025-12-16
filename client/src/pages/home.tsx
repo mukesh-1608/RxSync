@@ -1,7 +1,6 @@
 import { useState, useCallback, useEffect } from "react";
 import {
   FileCode,
-  FileSpreadsheet,
   Download,
   Loader2,
   Play,
@@ -15,19 +14,16 @@ import { ProgressStepper } from "@/components/ProgressStepper";
 import { ImageUploadZone } from "@/components/ImageUploadZone";
 import { ImagePreviewGrid } from "@/components/ImagePreviewGrid";
 import { OCRResultsPanel } from "@/components/OCRResultsPanel";
-import { DataTable } from "@/components/DataTable";
 import { XMLPreview } from "@/components/XMLPreview";
 import { ThemeToggle } from "@/components/ThemeToggle";
-import { performOCR } from "@/lib/ocr"; // Removed preprocessImage import
-import { parseOCRText, generateCSV, generateXML, downloadFile } from "@/lib/parser";
-import type { UploadedImage, ParsedRecord } from "@shared/schema";
+import { downloadFile } from "@/lib/parser";
+import type { UploadedImage } from "@shared/schema";
 
 export default function Home() {
   const { toast } = useToast();
   const [currentStep, setCurrentStep] = useState(1);
   const [completedSteps, setCompletedSteps] = useState<number[]>([]);
   const [uploadedImages, setUploadedImages] = useState<UploadedImage[]>([]);
-  const [parsedData, setParsedData] = useState<ParsedRecord[]>([]);
   const [xmlOutput, setXmlOutput] = useState("");
   const [processing, setProcessing] = useState(false);
 
@@ -56,11 +52,7 @@ export default function Home() {
       }));
 
       setUploadedImages((prev) => [...prev, ...newImages]);
-
-      toast({
-        title: "Images uploaded",
-        description: `${files.length} image${files.length > 1 ? "s" : ""} added successfully.`,
-      });
+      toast({ title: "Images added", description: `Ready to process ${files.length} files.` });
     },
     [toast]
   );
@@ -68,137 +60,16 @@ export default function Home() {
   const handleRemoveImage = useCallback((id: string) => {
     setUploadedImages((prev) => {
       const image = prev.find((img) => img.id === id);
-      if (image) {
-        URL.revokeObjectURL(image.preview);
-      }
+      if (image) URL.revokeObjectURL(image.preview);
       const remaining = prev.filter((img) => img.id !== id);
-      
       if (remaining.length === 0) {
-        setParsedData([]);
         setXmlOutput("");
         setCompletedSteps([]);
         setCurrentStep(1);
       }
-      
       return remaining;
     });
   }, []);
-
-  const processImages = useCallback(async () => {
-    const pendingImages = uploadedImages.filter(
-      (img) => img.status === "pending" || img.status === "error"
-    );
-
-    if (pendingImages.length === 0) {
-      toast({
-        title: "No images to process",
-        description: "All images have already been processed.",
-        variant: "destructive",
-      });
-      return;
-    }
-
-    setProcessing(true);
-    setCurrentStep(2);
-
-    let successCount = 0;
-    // Calculate a global starting index for records so IDs don't clash across images
-    let currentRecordCount = parsedData.length + 1; 
-
-    for (const image of pendingImages) {
-      setUploadedImages((prev) =>
-        prev.map((img) =>
-          img.id === image.id
-            ? { ...img, status: "processing" as const, progress: 0 }
-            : img
-        )
-      );
-
-      try {
-        // Direct file OCR (no client-side preprocessing needed for AWS)
-        const ocrResult = await performOCR(image.file, (progress) => {
-          setUploadedImages((prev) =>
-            prev.map((img) =>
-              img.id === image.id ? { ...img, progress } : img
-            )
-          );
-        });
-
-        const parsedRecords = parseOCRText(
-          ocrResult.text,
-          image.file.name,
-          currentRecordCount
-        );
-        
-        currentRecordCount += parsedRecords.length;
-
-        setUploadedImages((prev) =>
-          prev.map((img) =>
-            img.id === image.id
-              ? {
-                  ...img,
-                  status: "complete" as const,
-                  progress: 100,
-                  rawText: ocrResult.text,
-                  parsedData: parsedRecords,
-                }
-              : img
-          )
-        );
-        successCount++;
-      } catch (error) {
-        const errorMessage =
-          error instanceof Error ? error.message : "OCR processing failed";
-
-        setUploadedImages((prev) =>
-          prev.map((img) =>
-            img.id === image.id
-              ? {
-                  ...img,
-                  status: "error" as const,
-                  error: errorMessage,
-                }
-              : img
-          )
-        );
-
-        toast({
-          title: "Processing error",
-          description: `Failed to process ${image.file.name}: ${errorMessage}`,
-          variant: "destructive",
-        });
-      }
-    }
-
-    setProcessing(false);
-
-    setUploadedImages((current) => {
-      const completedImages = current.filter((img) => img.status === "complete");
-      // Flatten the arrays of records from all images
-      const newParsedData = completedImages
-        .flatMap((img) => img.parsedData || []);
-        
-      setParsedData(newParsedData);
-      
-      if (newParsedData.length > 0) {
-        setCompletedSteps((prev) => {
-          const updated = [...prev];
-          if (!updated.includes(2)) updated.push(2);
-          return updated;
-        });
-        setCurrentStep(3);
-      }
-      
-      return current;
-    });
-
-    if (successCount > 0) {
-      toast({
-        title: "Processing complete",
-        description: `Successfully processed ${successCount} image${successCount > 1 ? "s" : ""}. Review the parsed data below.`,
-      });
-    }
-  }, [uploadedImages, toast, parsedData.length]);
 
   const handleRetryFailed = useCallback(() => {
     setUploadedImages((prev) =>
@@ -210,82 +81,110 @@ export default function Home() {
     );
   }, []);
 
-  const handleDataChange = useCallback((newData: ParsedRecord[]) => {
-    setParsedData(newData);
-  }, []);
+  const processImages = useCallback(async () => {
+    const pendingImages = uploadedImages.filter(
+      (img) => img.status === "pending" || img.status === "error"
+    );
 
-  const handleDownloadCSV = useCallback(() => {
-    if (parsedData.length === 0) {
-      toast({
-        title: "No data to export",
-        description: "Process some images first to generate CSV.",
-        variant: "destructive",
-      });
-      return;
+    if (pendingImages.length === 0) {
+        toast({
+            title: "No images to process",
+            description: "All images have already been processed.",
+            variant: "destructive",
+        });
+        return;
     }
 
-    const csv = generateCSV(parsedData);
-    downloadFile(csv, "pharmacy_data.csv", "text/csv");
+    setProcessing(true);
+    setCurrentStep(2);
 
-    toast({
-      title: "CSV downloaded",
-      description: "Your CSV file has been saved.",
-    });
-  }, [parsedData, toast]);
+    let successCount = 0; // Track successes to decide whether to show success toast
 
-  const handleGenerateXML = useCallback(() => {
-    if (parsedData.length === 0) {
-      toast({
-        title: "No data to export",
-        description: "Process some images first to generate XML.",
-        variant: "destructive",
-      });
-      return;
+    for (const image of pendingImages) {
+      setUploadedImages((prev) =>
+        prev.map((img) =>
+          img.id === image.id
+            ? { ...img, status: "processing" as const, progress: 20 }
+            : img
+        )
+      );
+
+      try {
+        const formData = new FormData();
+        formData.append("image", image.file);
+
+        // Call the new Server-Side Pipeline (AWS + Gemini)
+        const response = await fetch("/api/process-image", {
+          method: "POST",
+          body: formData,
+        });
+
+        if (!response.ok) {
+          const errorData = await response.json();
+          throw new Error(errorData.message || "Server processing failed");
+        }
+
+        const data = await response.json();
+
+        setUploadedImages((prev) =>
+          prev.map((img) =>
+            img.id === image.id
+              ? {
+                  ...img,
+                  status: "complete" as const,
+                  progress: 100,
+                  rawText: data.rawText, // Raw text from Textract
+                }
+              : img
+          )
+        );
+
+        // Accumulate XML output from Gemini
+        setXmlOutput((prev) => (prev ? prev + "\n" + data.xml : data.xml));
+        successCount++;
+
+      } catch (error) {
+        const errorMessage = error instanceof Error ? error.message : "Error";
+        setUploadedImages((prev) =>
+          prev.map((img) =>
+            img.id === image.id
+              ? { ...img, status: "error" as const, error: errorMessage }
+              : img
+          )
+        );
+        toast({
+          title: "Processing Error",
+          description: `Failed to process ${image.file.name}: ${errorMessage}`,
+          variant: "destructive",
+        });
+      }
     }
 
-    const xml = generateXML(parsedData);
-    setXmlOutput(xml);
-    setCompletedSteps((prev) => {
-      const updated = [...prev];
-      if (!updated.includes(3)) updated.push(3);
-      return updated;
-    });
-    setCurrentStep(4);
+    setProcessing(false);
+    
+    // Only show success and advance steps if at least one image worked
+    if (successCount > 0) {
+        setCompletedSteps((prev) => Array.from(new Set([...prev, 2, 3, 4])));
+        setCurrentStep(4);
+        
+        toast({
+            title: "Processing Complete",
+            description: `XML generated successfully for ${successCount} file(s).`,
+        });
+    }
 
-    toast({
-      title: "XML generated",
-      description: "Your XML output is ready for download.",
-    });
-  }, [parsedData, toast]);
+  }, [uploadedImages, toast]);
 
   const handleDownloadXML = useCallback(() => {
-    if (!xmlOutput) {
-      toast({
-        title: "No XML to download",
-        description: "Generate XML first before downloading.",
-        variant: "destructive",
-      });
-      return;
-    }
-
-    downloadFile(xmlOutput, "pharmacy_data.xml", "application/xml");
-    setCompletedSteps((prev) => {
-      const updated = [...prev];
-      if (!updated.includes(4)) updated.push(4);
-      return updated;
-    });
-
-    toast({
-      title: "XML downloaded",
-      description: "Your XML file has been saved.",
-    });
+    if (!xmlOutput) return;
+    downloadFile(xmlOutput, "medical_records.xml", "application/xml");
+    toast({ title: "Downloaded", description: "XML file saved." });
   }, [xmlOutput, toast]);
 
   const hasImages = uploadedImages.length > 0;
-  const hasPendingImages = uploadedImages.some(
-    (img) => img.status === "pending"
-  );
+  const isProcessing = processing;
   const hasFailedImages = uploadedImages.some((img) => img.status === "error");
+  const hasPendingImages = uploadedImages.some((img) => img.status === "pending");
 
   return (
     <div className="min-h-screen bg-background" data-testid="home-page">
@@ -298,10 +197,10 @@ export default function Home() {
               </div>
               <div>
                 <h1 className="text-xl font-semibold text-foreground" data-testid="text-app-title">
-                  PharmaScan
+                  PharmaScan AI
                 </h1>
                 <p className="text-xs text-muted-foreground hidden sm:block">
-                  Image to XML Converter
+                  AWS Textract + Gemini Pipeline
                 </p>
               </div>
             </div>
@@ -312,6 +211,7 @@ export default function Home() {
 
       <main className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
         <div className="space-y-8">
+          {/* Progress Stepper */}
           <Card>
             <CardContent className="py-6">
               <ProgressStepper
@@ -321,16 +221,17 @@ export default function Home() {
             </CardContent>
           </Card>
 
+          {/* Step 1: Upload */}
           <Card>
             <CardHeader>
               <div className="flex items-center gap-3">
-                <div className="w-8 h-8 rounded-full bg-primary/10 flex items-center justify-center text-sm font-semibold text-primary" data-testid="step-number-1">
+                <div className="w-8 h-8 rounded-full bg-primary/10 flex items-center justify-center text-sm font-semibold text-primary">
                   1
                 </div>
                 <div>
-                  <CardTitle className="text-xl">Upload Images</CardTitle>
+                  <CardTitle className="text-xl">Upload Documents</CardTitle>
                   <CardDescription>
-                    Add pharmacy order form images for processing
+                    Upload pharmacy order forms (JPEG/PNG)
                   </CardDescription>
                 </div>
               </div>
@@ -348,17 +249,18 @@ export default function Home() {
             </CardContent>
           </Card>
 
+          {/* Step 2: Processing */}
           <Card>
             <CardHeader>
               <div className="flex items-center justify-between gap-4 flex-wrap">
                 <div className="flex items-center gap-3">
-                  <div className="w-8 h-8 rounded-full bg-primary/10 flex items-center justify-center text-sm font-semibold text-primary" data-testid="step-number-2">
+                  <div className="w-8 h-8 rounded-full bg-primary/10 flex items-center justify-center text-sm font-semibold text-primary">
                     2
                   </div>
                   <div>
-                    <CardTitle className="text-xl">OCR Processing</CardTitle>
+                    <CardTitle className="text-xl">AI Processing</CardTitle>
                     <CardDescription>
-                      Extract text from uploaded images (Powered by AWS Textract)
+                      Extract & Structure Data (AWS Textract + Gemini)
                     </CardDescription>
                   </div>
                 </div>
@@ -368,7 +270,6 @@ export default function Home() {
                       variant="outline"
                       onClick={handleRetryFailed}
                       disabled={processing}
-                      data-testid="button-retry-failed"
                     >
                       <RefreshCw className="w-4 h-4 mr-2" />
                       Retry Failed
@@ -377,7 +278,6 @@ export default function Home() {
                   <Button
                     onClick={processImages}
                     disabled={!hasImages || processing || !hasPendingImages}
-                    data-testid="button-process-images"
                   >
                     {processing ? (
                       <>
@@ -387,7 +287,7 @@ export default function Home() {
                     ) : (
                       <>
                         <Play className="w-4 h-4 mr-2" />
-                        Process Images
+                        Start Extraction
                       </>
                     )}
                   </Button>
@@ -399,69 +299,30 @@ export default function Home() {
             </CardContent>
           </Card>
 
+          {/* Step 3 & 4: XML Output */}
+          {/* Note: We skip the manual table review step because Gemini returns final XML directly */}
           <Card>
             <CardHeader>
               <div className="flex items-center justify-between gap-4 flex-wrap">
                 <div className="flex items-center gap-3">
-                  <div className="w-8 h-8 rounded-full bg-primary/10 flex items-center justify-center text-sm font-semibold text-primary" data-testid="step-number-3">
+                  <div className="w-8 h-8 rounded-full bg-primary/10 flex items-center justify-center text-sm font-semibold text-primary">
                     3
                   </div>
                   <div>
-                    <CardTitle className="text-xl">Review Parsed Data</CardTitle>
+                    <CardTitle className="text-xl">XML Output</CardTitle>
                     <CardDescription>
-                      Edit and verify extracted information ({parsedData.length} record{parsedData.length !== 1 ? "s" : ""})
+                      Generated Medical XML Data
                     </CardDescription>
                   </div>
                 </div>
                 <Button
                   variant="outline"
-                  onClick={handleDownloadCSV}
-                  disabled={parsedData.length === 0}
-                  data-testid="button-download-csv"
+                  onClick={handleDownloadXML}
+                  disabled={!xmlOutput}
                 >
-                  <FileSpreadsheet className="w-4 h-4 mr-2" />
-                  Download CSV
+                  <Download className="w-4 h-4 mr-2" />
+                  Download XML
                 </Button>
-              </div>
-            </CardHeader>
-            <CardContent>
-              <DataTable data={parsedData} onDataChange={handleDataChange} />
-            </CardContent>
-          </Card>
-
-          <Card>
-            <CardHeader>
-              <div className="flex items-center justify-between gap-4 flex-wrap">
-                <div className="flex items-center gap-3">
-                  <div className="w-8 h-8 rounded-full bg-primary/10 flex items-center justify-center text-sm font-semibold text-primary" data-testid="step-number-4">
-                    4
-                  </div>
-                  <div>
-                    <CardTitle className="text-xl">Generate XML</CardTitle>
-                    <CardDescription>
-                      Create structured XML output from parsed data
-                    </CardDescription>
-                  </div>
-                </div>
-                <div className="flex items-center gap-2 flex-wrap">
-                  <Button
-                    variant="outline"
-                    onClick={handleGenerateXML}
-                    disabled={parsedData.length === 0}
-                    data-testid="button-generate-xml"
-                  >
-                    <FileCode className="w-4 h-4 mr-2" />
-                    Generate XML
-                  </Button>
-                  <Button
-                    onClick={handleDownloadXML}
-                    disabled={!xmlOutput}
-                    data-testid="button-download-xml"
-                  >
-                    <Download className="w-4 h-4 mr-2" />
-                    Download XML
-                  </Button>
-                </div>
               </div>
             </CardHeader>
             <CardContent>
@@ -473,8 +334,8 @@ export default function Home() {
 
       <footer className="border-t mt-12">
         <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-6">
-          <p className="text-sm text-muted-foreground text-center" data-testid="text-footer">
-            PharmaScan - Pharmacy Order Form Image to XML Converter
+          <p className="text-sm text-muted-foreground text-center">
+            PharmaScan AI - Powered by AWS & Google Gemini
           </p>
         </div>
       </footer>

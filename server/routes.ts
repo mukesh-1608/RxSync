@@ -1,53 +1,48 @@
 import type { Express } from "express";
 import { createServer, type Server } from "http";
 import multer from "multer";
-import { TextractClient, DetectDocumentTextCommand } from "@aws-sdk/client-textract";
+import { uploadToS3, performTextractAnalysis } from "./services/aws";
+import { processWithGemini } from "./services/gemini";
 
-// Configure Multer for memory storage (files held in RAM to send to AWS)
+// Keep memory storage to pass buffer to Gemini easily
 const upload = multer({ 
   storage: multer.memoryStorage(),
-  limits: { fileSize: 10 * 1024 * 1024 } // 10MB limit
+  limits: { fileSize: 10 * 1024 * 1024 } 
 });
-
-// Initialize AWS Client
-// Make sure AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, and AWS_REGION are in your .env file
-const textract = new TextractClient({ region: process.env.AWS_REGION || "us-east-1" });
 
 export async function registerRoutes(
   httpServer: Server,
   app: Express
 ): Promise<Server> {
   
-  // API Route to handle OCR via AWS Textract
   app.post("/api/process-image", upload.single("image"), async (req, res) => {
     try {
       if (!req.file) {
         return res.status(400).json({ message: "No image file provided" });
       }
 
-      console.log(`Processing file: ${req.file.originalname} (${req.file.size} bytes)`);
+      console.log(`[1/3] Uploading ${req.file.originalname} to S3...`);
+      const s3Key = await uploadToS3(req.file);
 
-      const params = {
-        Document: {
-          Bytes: req.file.buffer,
-        },
-      };
+      console.log(`[2/3] Analyzing text with AWS Textract...`);
+      const { rawLines } = await performTextractAnalysis(s3Key);
 
-      const command = new DetectDocumentTextCommand(params);
-      const response = await textract.send(command);
+      console.log(`[3/3] Generating XML with Gemini...`);
+      // We pass both the image buffer (visual context) and Textract lines (text context)
+      const xmlOutput = await processWithGemini(req.file.buffer, rawLines);
 
-      // EXTRACT LINES
-      // Textract returns separate "LINES" and "WORDS". We want the lines to preserve row structure.
-      const lines = response.Blocks
-        ?.filter(block => block.BlockType === "LINE")
-        .map(block => block.Text)
-        .join("\n");
-
-      res.json({ text: lines || "" });
+      res.json({ 
+        success: true,
+        xml: xmlOutput,
+        rawText: rawLines
+      });
 
     } catch (error) {
-      console.error("Textract Error:", error);
-      res.status(500).json({ message: "Failed to process image with AWS Textract" });
+      console.error("Pipeline Error:", error);
+      res.status(500).json({ 
+        message: "Processing failed", 
+        details: error instanceof Error ? error.message : "Unknown error" 
+      });
     }
   });
 
