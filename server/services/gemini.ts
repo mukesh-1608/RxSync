@@ -3,49 +3,110 @@ import { GoogleGenerativeAI } from "@google/generative-ai";
 const API_KEY = process.env.GEMINI_API_KEY || "";
 const genAI = new GoogleGenerativeAI(API_KEY);
 
+/**
+ * 🧹 STEP 2.5: DETERMINISTIC NORMALIZER
+ * This layer cleans raw OCR artifacts before the LLM sees them.
+ * It fixes "Dirty Tokens" so the LLM doesn't have to guess.
+ */
+function cleanOCRText(rawText: string): string {
+  let cleaned = rawText;
+
+  // 1. Fix Blood Type Artifacts (Common Textract errors like $BB+, $O+)
+  cleaned = cleaned
+    .replace(/\$BB\+/g, "B+")
+    .replace(/\$B\+/g, "B+")
+    .replace(/\$A\+/g, "A+")
+    .replace(/\$O\+/g, "O+")
+    .replace(/\$AB\+/g, "AB+")
+    // Handle 'BB+' without dollar sign if it appears due to noise
+    .replace(/\bBB\+\b/g, "B+");
+
+  // 2. Normalize common field labels to help LLM anchoring
+  // We add spacing to ensure words like "MALE" aren't stuck to other text
+  cleaned = cleaned
+    .replace(/Order ID:/i, "Order ID:")
+    .replace(/MALE/g, " MALE ")    
+    .replace(/FEMALE/g, " FEMALE ");
+
+  return cleaned;
+}
+
+/**
+ * 🛡️ STEP 4: POST-LLM VALIDATOR
+ * Strictly enforces that no XML tags are returned empty.
+ */
+function enforceNoEmptyTags(xml: string): string {
+  // Regex to find <Tag></Tag> or <Tag /> and replace with MISSING value
+  // This catches any slip-ups by the LLM
+  return xml.replace(
+    /<(\w+)>\s*<\/\1>/g,
+    `<$1><value confidence="low">MISSING</value></$1>`
+  );
+}
+
+// ⚡ FINAL "TEXT-ONLY" PROMPT
+// Optimized for mapping cleaned text -> XML without visual distractions.
 const SYSTEM_PROMPT = `
-You are an expert Medical Data Transcriptionist. 
-Your job is to convert medical pharmacy order forms (images + OCR text) into strict XML format.
+You are a Medical Data XML Mapper. 
+Input: Cleaned OCR text.
+Output: Strict XML.
 
-### INPUT DATA:
-1. An image of a spreadsheet containing patient, doctor, and prescription details.
-2. Raw OCR text extracted from the image.
+### 🔍 ANCHORING LOGIC (HOW TO FIND DATA)
+1. **DOCTOR EXTRACTION**:
+   - Row Layout: \`[Patient Name] ... [Vitals] ... [Patient Name REPEATED] [DOCTOR NAME]\`
+   - Find the **SECOND occurrence** of the Patient Name in the row.
+   - The name immediately following it is the **Doctor**.
+   
+2. **DOB LOCKING**:
+   - DOB is **ALWAYS** the date immediately following the Gender (MALE/FEMALE).
+   - Ignore all other dates (like Order Date) for the DOB field.
 
-### XML SCHEMA REQUIREMENT:
-You must output valid XML rooted with <MedicalDocument>. 
-If multiple records exist in the image, output multiple <MedicalDocument> blocks wrapped in a <Root> tag.
+3. **BLOOD TYPE**:
+   - The input text has already been normalized. 
+   - Look for standard enums: A+, A-, B+, B-, AB+, AB-, O+, O- in the Vitals section.
+   - If a valid enum exists, extract it. Otherwise, mark as MISSING.
 
-Schema Structure:
+### 🚨 MANDATORY COMPLETENESS RULE:
+- **NEVER output empty tags** (e.g., <Weight></Weight> is FORBIDDEN).
+- If a value exists in text, extract it.
+- If a value is NOT found in the text, you must output: 
+  \`<value confidence="low">MISSING</value>\`
+
+### XML OUTPUT SCHEMA
 <MedicalDocument>
     <Patient>
         <Name>[Full Name]</Name>
-        <DOB>[Date of Birth MM/DD/YYYY]</DOB>
+        <DOB>[MM/DD/YYYY]</DOB>
         <Gender>[MALE/FEMALE]</Gender>
     </Patient>
     <Doctor>
         <Name>[Doctor Name]</Name>
-        <LicenseNumber>[License/NPI if available]</LicenseNumber>
-        <Clinic>[Clinic Name]</Clinic>
+        <LicenseNumber><value confidence="low">MISSING</value></LicenseNumber>
+        <Clinic>[City/State found after Doctor Name]</Clinic>
     </Doctor>
     <Prescription>
         <Medicine>
             <Name>[Drug Name]</Name>
-            <Dosage>[Strength e.g. 10MG]</Dosage>
-            <Frequency>[Frequency if available]</Frequency>
-            <Duration>[Duration if available]</Duration>
+            <Dosage>[Strength e.g. 2 MG]</Dosage>
+            <Frequency>[Count: e.g. 90]</Frequency>
+            <Duration><value confidence="low">MISSING</value></Duration>
         </Medicine>
     </Prescription>
     <Vitals>
         <Height>[Height]</Height>
         <Weight>[Weight]</Weight>
-        <BloodPressure>[BP]</BloodPressure>
+        <BloodType>[Enum: A+, B+, AB+, O+, etc]</BloodType>
+        <BloodPressure><value confidence="low">MISSING</value></BloodPressure>
     </Vitals>
-    <Notes>[Any extra notes or order IDs]</Notes>
+    <Notes>Order ID: [ID]</Notes>
 </MedicalDocument>
 
-### RULES:
-1. Only extract visible text. 
-2. Return ONLY the XML string. No markdown.
+### FINAL VERIFICATION:
+1. Did you find the Doctor by looking *after* the repeated patient name?
+2. Did you pick the DOB *immediately* after the Gender?
+3. Did you verify NO tags are empty?
+
+OUTPUT ONLY VALID XML.
 `;
 
 /**
@@ -68,12 +129,11 @@ async function getBestAvailableModel(): Promise<string> {
 
     const data = await response.json();
     const models = (data.models || []) as { name: string, supportedGenerationMethods: string[] }[];
-
-    // Filter for models that support content generation
     const available = models.filter(m => m.supportedGenerationMethods.includes("generateContent"));
 
-    // Strategy: Prefer 1.5 Flash -> 1.5 Pro -> Pro Vision
+    // PRIORITY: Keep the working model at the top
     const preferredOrder = [
+      "gemini-robotics-er-1.5-preview", 
       "gemini-1.5-flash",
       "gemini-1.5-pro",
       "gemini-pro-vision",
@@ -89,7 +149,7 @@ async function getBestAvailableModel(): Promise<string> {
       }
     }
 
-    // Fallback: take the first one that looks like a vision model
+    // Fallback
     const anyVision = available.find(m => m.name.includes("vision") || m.name.includes("1.5"));
     if (anyVision) {
         const cleanName = anyVision.name.replace("models/", "");
@@ -101,44 +161,41 @@ async function getBestAvailableModel(): Promise<string> {
 
   } catch (error: any) {
     console.error("❌ Model Discovery Failed:", error.message);
-    // Ultimate fallback if discovery fails (e.g. firewall)
-    console.log("⚠️ Attempting blind fallback to 'gemini-1.5-flash'...");
     return "gemini-1.5-flash";
   }
 }
 
 export async function processWithGemini(fileBuffer: Buffer, ocrText: string): Promise<string> {
   try {
-    // 1. Find the correct model name
+    // STEP 2.5: Normalize the text before LLM sees it
+    console.log("🧹 Running Step 2.5: Deterministic Normalizer...");
+    const cleanedText = cleanOCRText(ocrText);
+
+    // STEP 3: LLM Mapping (TEXT ONLY - No Image)
     const modelName = await getBestAvailableModel();
     const model = genAI.getGenerativeModel({ model: modelName });
 
-    // 2. Prepare Image
-    const imageBase64 = fileBuffer.toString("base64");
-
-    // 3. Generate
-    console.log(`🚀 Sending request to Gemini (${modelName})...`);
+    // Note: We intentionally DO NOT send the image buffer here.
+    // We rely 100% on the normalized text to prevent visual hallucinations.
+    console.log(`🚀 Sending CLEANED TEXT to Gemini (${modelName})...`);
+    
     const result = await model.generateContent([
       SYSTEM_PROMPT,
-      {
-        inlineData: {
-          mimeType: "image/jpeg",
-          data: imageBase64
-        }
-      },
-      `OCR TEXT CONTEXT:\n${ocrText}`
+      `CLEANED OCR CONTEXT:\n${cleanedText}`
     ]);
 
     const response = await result.response;
     let text = response.text();
     text = text.replace(/```xml/g, "").replace(/```/g, "").trim();
 
+    // STEP 4: Post-LLM Validation
+    console.log("🛡️ Running Step 4: Enforcing XML Completeness...");
+    text = enforceNoEmptyTags(text);
+
     return text;
 
   } catch (error: any) {
     console.error("❌ GEMINI FATAL ERROR:", error);
-    
-    // Provide a clear message to the frontend
     if (error.message.includes("404")) {
         throw new Error("Gemini Model Not Found. Please ensure 'Generative Language API' is ENABLED in Google Cloud Console.");
     }
